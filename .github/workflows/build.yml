@@ -273,10 +273,14 @@ jobs:
       - name: Publish or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          # Explicit repository context prevents gh from trying to infer the repo
+          # by running `git` in the current directory.
+          GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
           TAG="$GITHUB_REF_NAME"
+          REPO="$GITHUB_REPOSITORY"
           DIST="$RUNNER_TEMP/release-assets"
           shopt -s nullglob
           assets=("$DIST"/*.apk "$DIST"/*.zip "$DIST"/BUILD-INFO.txt "$DIST"/SHA256SUMS.txt)
@@ -285,15 +289,15 @@ jobs:
             exit 1
           fi
 
-          if gh release view "$TAG" >/dev/null 2>&1; then
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             echo "Release $TAG already exists; replacing assets with this successful build."
-            gh release upload "$TAG" "${assets[@]}" --clobber
+            gh release upload "$TAG" "${assets[@]}" --clobber --repo "$REPO"
           else
             release_flags=(--title "AssetStudioMobile $TAG" --generate-notes --verify-tag)
             # Tags such as v1.10.3-beta.1 are published as pre-releases.
             if [[ "$TAG" == *-* ]]; then
               release_flags+=(--prerelease)
             fi
-            gh release create "$TAG" "${assets[@]}" "${release_flags[@]}"
+            gh release create "$TAG" "${assets[@]}" "${release_flags[@]}" --repo "$REPO"
           fi
 

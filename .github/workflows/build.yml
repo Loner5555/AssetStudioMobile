@@ -3,6 +3,8 @@ name: Translate Chinese and Build APK
 on:
   push:
     branches: ["**"]
+    # Publishing a version tag (for example v1.10.3) also creates a GitHub Release.
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
     inputs:
@@ -175,3 +177,116 @@ jobs:
           else
             echo "::warning::Could not push the translation commit. Download the translated-source artifact instead."
           fi
+
+  publish-release:
+    name: Publish APKs and source to GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download APK artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: AssetStudioMobile-APKs
+          path: ${{ runner.temp }}/release-input/apks
+
+      - name: Download translated source archive
+        uses: actions/download-artifact@v8
+        with:
+          name: AssetStudioMobile-translated-source
+          path: ${{ runner.temp }}/release-input/source
+
+      - name: Prepare release files and checksums
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          APK_ROOT="$RUNNER_TEMP/release-input/apks"
+          SOURCE_ROOT="$RUNNER_TEMP/release-input/source"
+          DIST="$RUNNER_TEMP/release-assets"
+          mkdir -p "$DIST"
+
+          apk_count=0
+          while IFS= read -r -d '' apk; do
+            name="$(basename "$apk")"
+            case "$name" in
+              app-debug.apk)
+                cp "$apk" "$DIST/AssetStudioMobile-${RELEASE_TAG}-debug.apk"
+                ;;
+              app-release.apk)
+                cp "$apk" "$DIST/AssetStudioMobile-${RELEASE_TAG}-release.apk"
+                ;;
+              *)
+                relative="${apk#"$APK_ROOT"/}"
+                safe_name="${relative//\//-}"
+                cp "$apk" "$DIST/AssetStudioMobile-${RELEASE_TAG}-${safe_name}"
+                ;;
+            esac
+            apk_count=$((apk_count + 1))
+          done < <(find "$APK_ROOT" -type f -name '*.apk' -print0)
+
+          if [[ "$apk_count" -eq 0 ]]; then
+            echo "::error::No APK files were downloaded from the build job."
+            exit 1
+          fi
+          if [[ ! -f "$DIST/AssetStudioMobile-${RELEASE_TAG}-release.apk" ]]; then
+            echo "::error::The release APK app-release.apk was not found."
+            exit 1
+          fi
+
+          source_zip="$(find "$SOURCE_ROOT" -type f -name '*.zip' -print -quit)"
+          if [[ -z "$source_zip" ]]; then
+            echo "::error::Translated source ZIP was not found."
+            exit 1
+          fi
+          cp "$source_zip" "$DIST/AssetStudioMobile-${RELEASE_TAG}-translated-source.zip"
+
+          cat > "$DIST/BUILD-INFO.txt" <<EOF
+          Project: AssetStudioMobile
+          Release tag: ${RELEASE_TAG}
+          Commit: ${COMMIT_SHA}
+          Repository: https://github.com/${REPOSITORY}
+          GitHub Actions run: https://github.com/${REPOSITORY}/actions/runs/${RUN_ID}
+          Build assets: release APK, debug APK (if produced), translated source archive.
+
+          Note: The release APK uses the signing configuration available to the project at build time.
+          EOF
+
+          (cd "$DIST" && sha256sum *.apk *.zip BUILD-INFO.txt > SHA256SUMS.txt)
+          echo "Prepared release assets:"
+          ls -lh "$DIST"
+
+      - name: Publish or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="$GITHUB_REF_NAME"
+          DIST="$RUNNER_TEMP/release-assets"
+          shopt -s nullglob
+          assets=("$DIST"/*.apk "$DIST"/*.zip "$DIST"/BUILD-INFO.txt "$DIST"/SHA256SUMS.txt)
+          if [[ ${#assets[@]} -lt 4 ]]; then
+            echo "::error::Release assets are incomplete."
+            exit 1
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; replacing assets with this successful build."
+            gh release upload "$TAG" "${assets[@]}" --clobber
+          else
+            release_flags=(--title "AssetStudioMobile $TAG" --generate-notes --verify-tag)
+            # Tags such as v1.10.3-beta.1 are published as pre-releases.
+            if [[ "$TAG" == *-* ]]; then
+              release_flags+=(--prerelease)
+            fi
+            gh release create "$TAG" "${assets[@]}" "${release_flags[@]}"
+          fi
+

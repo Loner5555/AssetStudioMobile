@@ -321,28 +321,6 @@ def extract_spans(content: str, suffix: str) -> list[Span]:
     return _code_spans(content, suffix.lower())
 
 
-def _protect(text: str) -> tuple[str, dict[str, str]]:
-    mapping: dict[str, str] = {}
-    idx = 0
-
-    def replace(match: re.Match[str]) -> str:
-        nonlocal idx
-        token = f"ZXQPH{idx:05d}ZXQ"
-        mapping[token] = match.group(0)
-        idx += 1
-        return token
-
-    return PROTECTED_RE.sub(replace, text), mapping
-
-
-def _restore(text: str, mapping: dict[str, str]) -> str:
-    for token, original in mapping.items():
-        if token not in text:
-            raise ValueError(f"Translation service changed a protected placeholder: {token}")
-        text = text.replace(token, original)
-    return text
-
-
 def _escape_literal(text: str, quote: str) -> str:
     """Escape quote characters newly introduced into a source string literal."""
     out: list[str] = []
@@ -376,8 +354,7 @@ def _load_translation_cache() -> None:
             _TRANSLATION_CACHE = {}
     except (OSError, json.JSONDecodeError):
         _TRANSLATION_CACHE = {}
-    # Create the cache file even before the first network call, so GitHub Actions
-    # can persist an empty/partial cache if the external service fails immediately.
+    # Create the cache file immediately so GitHub Actions can persist partial progress.
     _save_translation_cache()
 
 
@@ -447,78 +424,63 @@ def _load_argos_translator():
         raise RuntimeError("Argos zh→en model installed, but the translation was not registered")
     return translation
 
-def _finish_translation(index: int, value: str, items: list[str], maps: list[dict[str, str]], results: list[str | None]) -> None:
-    mapping = maps[index]
-    protected_mapping = {k: v for k, v in mapping.items() if not k.startswith("__")}
-    body = _restore(value.strip(), protected_mapping)
-    final_value = mapping["__LEADING__"] + body + mapping["__TRAILING__"]
-    results[index] = final_value
-    _TRANSLATION_CACHE[_cache_key(items[index])] = final_value
+def _translate_plain_run(text: str, translator) -> str:
+    """Translate a plain-text run while preserving its exact surrounding whitespace."""
+    if not _has_han(text):
+        return text
+    left = len(text) - len(text.lstrip())
+    right = len(text.rstrip())
+    if right <= left:
+        return text
+    leading, body, trailing = text[:left], text[left:right], text[right:]
+    translated = _request_translate(body, translator).strip()
+    return leading + translated + trailing
+
+
+def _translate_preserving_protected(text: str, translator) -> str:
+    """Translate only unprotected text runs; never send code tokens to the model.
+
+    Argos can alter artificial markers such as ZXQPH00000ZXQ. Splitting around the
+    original placeholders is safer: the protected parts never enter the translator,
+    so interpolation expressions, format specifiers, escapes and URLs are restored
+    byte-for-byte without relying on the model to preserve a marker.
+    """
+    pieces: list[str] = []
+    cursor = 0
+    for match in PROTECTED_RE.finditer(text):
+        pieces.append(_translate_plain_run(text[cursor:match.start()], translator))
+        pieces.append(match.group(0))
+        cursor = match.end()
+    pieces.append(_translate_plain_run(text[cursor:], translator))
+    return "".join(pieces)
 
 
 def _translate_batch_uncached(items: list[str], translator) -> list[str]:
-    """Translate uncached fragments in small chunks and persist each completed chunk."""
-    results: list[str | None] = [None] * len(items)
-    start_tokens = [f"ZXQSEG{i:05d}ZXQ" for i in range(len(items))]
-    end_tokens = [f"ZXQEND{i:05d}ZXQ" for i in range(len(items))]
-    protected: list[str] = []
-    maps: list[dict[str, str]] = []
-    for item in items:
-        body, edge = _strip_edges(item)
-        body_masked, mapping = _protect(body)
-        maps.append({**mapping, "__LEADING__": edge[0], "__TRAILING__": edge[1]})
-        protected.append(body_masked)
+    """Translate uncached fragments and persist progress in small batches.
 
-    pos = 0
-    while pos < len(items):
-        end = pos
-        size = 0
-        while end < len(items):
-            estimate = len(protected[end]) + 36
-            if end > pos and size + estimate > 3200:
-                break
-            if estimate > 4500:
-                break
-            size += estimate
-            end += 1
-
-        if end == pos:
-            # A single very long fragment cannot safely be included in a marker batch.
-            translated_item = _request_translate(protected[pos], translator)
-            _finish_translation(pos, translated_item, items, maps, results)
+    This intentionally translates each plain-text fragment independently instead
+    of concatenating fragments with synthetic boundary tokens. The local model may
+    normalize or drop such tokens, which can corrupt source placeholders or make the
+    entire run fail. Saving every ten completed fragments preserves useful progress
+    without rewriting the cache file for every single fragment.
+    """
+    results: list[str] = []
+    for index, item in enumerate(items):
+        try:
+            body, (leading, trailing) = _strip_edges(item)
+            translated_body = _translate_preserving_protected(body, translator)
+            final_value = leading + translated_body + trailing
+            results.append(final_value)
+            _TRANSLATION_CACHE[_cache_key(item)] = final_value
+        except Exception:
+            # Flush completed translations before propagating an error.
             _save_translation_cache()
-            pos += 1
-            continue
+            raise
 
-        payload = "\n".join(
-            f"{start_tokens[j]}{protected[j]}{end_tokens[j]}" for j in range(pos, end)
-        )
-        translated = _request_translate(payload, translator)
-        translated_segments: list[str] = []
-        found_all = True
-        for j in range(pos, end):
-            a = translated.find(start_tokens[j])
-            b = translated.find(end_tokens[j], a + len(start_tokens[j])) if a >= 0 else -1
-            if a < 0 or b < 0:
-                found_all = False
-                break
-            translated_segments.append(translated[a + len(start_tokens[j]):b].strip())
+        if (index + 1) % 10 == 0 or index + 1 == len(items):
+            _save_translation_cache()
 
-        if found_all:
-            for offset, segment in enumerate(translated_segments):
-                _finish_translation(pos + offset, segment, items, maps, results)
-        else:
-            # If Google modifies the boundary markers, use separate requests for this
-            # chunk instead of accidentally putting translated text in the wrong span.
-            for j in range(pos, end):
-                translated_item = _request_translate(protected[j], translator)
-                _finish_translation(j, translated_item, items, maps, results)
-
-        # Save after every successful chunk: a later rate limit won't lose prior work.
-        _save_translation_cache()
-        pos = end
-
-    return [str(value) for value in results]
+    return results
 
 
 def _translate_batch(items: list[str], translator) -> list[str]:

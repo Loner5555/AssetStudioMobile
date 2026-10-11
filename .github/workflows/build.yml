@@ -187,6 +187,13 @@ jobs:
     permissions:
       contents: write
     steps:
+      # This job runs on a fresh runner. Checkout the tagged repository so
+      # gh release create --verify-tag can verify the tag locally.
+      - name: Checkout tagged source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
       - name: Download APK artifacts
         uses: actions/download-artifact@v8
         with:

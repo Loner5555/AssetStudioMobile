@@ -165,3 +165,15 @@ AssetStudio 为 MIT 许可；本项目遵循相同许可。仅用于学习与研
 ---
 
 作者：醉莫
+
+## Automatic GitHub Actions build and translation
+
+The workflow in `.github/workflows/build.yml` runs on pushes and pull requests. It translates Chinese text found in supported source/documentation files to English, checks that no CJK text remains in those files, then builds both debug and release APKs.
+
+When a workflow run completes, open **Actions → the completed run → Artifacts** to download:
+
+- `AssetStudioMobile-APKs` — debug and release APKs.
+- `AssetStudioMobile-translated-source` — a ZIP of the translated source tree.
+
+To run it manually, open **Actions → Translate Chinese and Build APK → Run workflow**. Enable `commit_translations` only when you also want the workflow to commit the translated files back to the selected branch. The translator uses the Google Translate service through `deep-translator`, so the runner needs internet access; text is sent to that external translation service.
+

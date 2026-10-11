@@ -38,11 +38,30 @@ jobs:
           cache: pip
           cache-dependency-path: tools/requirements-translate.txt
 
+      - name: Restore translation cache
+        uses: actions/cache/restore@v4
+        with:
+          path: tools/.translation-cache.json
+          key: translate-cache-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            translate-cache-${{ runner.os }}-${{ github.ref_name }}-
+            translate-cache-${{ runner.os }}-
+
       - name: Install translation dependency
         run: python -m pip install --disable-pip-version-check -r tools/requirements-translate.txt
 
       - name: Translate Chinese text to English
+        env:
+          TRANSLATE_MIN_INTERVAL_SECONDS: "0.8"
+          TRANSLATE_MAX_ATTEMPTS: "6"
         run: python tools/translate_chinese.py --write
+
+      - name: Save translation cache (including partial progress)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: tools/.translation-cache.json
+          key: translate-cache-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
 
       - name: Verify no Chinese text remains
         run: python tools/translate_chinese.py --check
@@ -83,6 +102,8 @@ jobs:
                '**/.cxx/*' \
                '**/.externalNativeBuild/*' \
                'local.properties' \
+               'tools/.translation-cache.json' \
+               'tools/.translation-cache.json.tmp' \
                '*.apk' \
                '*.aab'
 

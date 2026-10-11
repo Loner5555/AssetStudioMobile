@@ -8,6 +8,9 @@ Translation is performed using Google Translate through deep-translator.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+import os
 import re
 import sys
 import time
@@ -16,6 +19,11 @@ from pathlib import Path
 from typing import Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
+CACHE_PATH = ROOT / "tools" / ".translation-cache.json"
+REQUEST_INTERVAL_SECONDS = max(0.5, float(os.getenv("TRANSLATE_MIN_INTERVAL_SECONDS", "0.8")))
+MAX_TRANSLATE_ATTEMPTS = max(3, int(os.getenv("TRANSLATE_MAX_ATTEMPTS", "6")))
+_LAST_REQUEST_AT = 0.0
+_TRANSLATION_CACHE: dict[str, str] = {}
 HAN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 SUPPORTED_SUFFIXES = {
     ".kt", ".java", ".kts", ".gradle", ".cpp", ".cc", ".c", ".h", ".hpp",
@@ -27,7 +35,7 @@ EXCLUDED_DIRS = {
     "node_modules", "vendor", "__pycache__",
 }
 EXCLUDED_FILES = {
-    "translate_chinese.py", "gradle-wrapper.jar", "local.properties",
+    "translate_chinese.py", "gradle-wrapper.jar", "local.properties", ".translation-cache.json",
 }
 
 # Protect runtime placeholders, format strings, escapes and URLs from the translator.
@@ -353,21 +361,107 @@ def _escape_literal(text: str, quote: str) -> str:
     return "".join(out)
 
 
-def _translate_batch(items: list[str], translator) -> list[str]:
-    """Translate many fragments in one request, falling back to per-fragment calls."""
+def _cache_key(text: str) -> str:
+    return hashlib.sha256(("zh-CN\0en\0" + text).encode("utf-8")).hexdigest()
+
+
+def _load_translation_cache() -> None:
+    global _TRANSLATION_CACHE
+    try:
+        data = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            _TRANSLATION_CACHE = {
+                str(key): str(value)
+                for key, value in data.items()
+                if isinstance(key, str) and isinstance(value, str)
+            }
+        else:
+            _TRANSLATION_CACHE = {}
+    except (OSError, json.JSONDecodeError):
+        _TRANSLATION_CACHE = {}
+    # Create the cache file even before the first network call, so GitHub Actions
+    # can persist an empty/partial cache if the external service fails immediately.
+    _save_translation_cache()
+
+
+def _save_translation_cache() -> None:
+    CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = CACHE_PATH.with_suffix(CACHE_PATH.suffix + ".tmp")
+    tmp_path.write_text(
+        json.dumps(_TRANSLATION_CACHE, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    tmp_path.replace(CACHE_PATH)
+
+
+def _request_translate(text: str, translator) -> str:
+    """Call Google Translate slowly, and use exponential backoff for rate limits."""
+    global _LAST_REQUEST_AT
+    if not text:
+        return text
+
+    last_error: Exception | None = None
+    for attempt in range(MAX_TRANSLATE_ATTEMPTS):
+        elapsed = time.monotonic() - _LAST_REQUEST_AT
+        if elapsed < REQUEST_INTERVAL_SECONDS:
+            time.sleep(REQUEST_INTERVAL_SECONDS - elapsed)
+
+        try:
+            result = translator.translate(text)
+            _LAST_REQUEST_AT = time.monotonic()
+            if result:
+                return result
+            last_error = RuntimeError("The translation service returned an empty result")
+        except Exception as exc:
+            _LAST_REQUEST_AT = time.monotonic()
+            last_error = exc
+
+        if attempt + 1 >= MAX_TRANSLATE_ATTEMPTS:
+            break
+
+        message = str(last_error).lower()
+        rate_limited = any(term in message for term in (
+            "too many requests", "429", "rate limit", "rate-limit", "too frequent",
+            "server error", "503", "temporarily unavailable", "forbidden",
+        ))
+        if rate_limited:
+            # Google may keep throttling a runner IP for a while. Back off much more
+            # aggressively than the previous fixed 1.5/3-second retry loop.
+            wait_seconds = min(60.0, 10.0 * (2 ** attempt))
+        else:
+            wait_seconds = min(20.0, 2.0 * (attempt + 1))
+        print(
+            f"Translation request failed ({attempt + 1}/{MAX_TRANSLATE_ATTEMPTS}): "
+            f"{last_error}. Retrying in {wait_seconds:g}s...",
+            file=sys.stderr,
+        )
+        time.sleep(wait_seconds)
+
+    raise RuntimeError(f"Google Translate failed after retries: {last_error}") from last_error
+
+
+def _finish_translation(index: int, value: str, items: list[str], maps: list[dict[str, str]], results: list[str | None]) -> None:
+    mapping = maps[index]
+    protected_mapping = {k: v for k, v in mapping.items() if not k.startswith("__")}
+    body = _restore(value.strip(), protected_mapping)
+    final_value = mapping["__LEADING__"] + body + mapping["__TRAILING__"]
+    results[index] = final_value
+    _TRANSLATION_CACHE[_cache_key(items[index])] = final_value
+
+
+def _translate_batch_uncached(items: list[str], translator) -> list[str]:
+    """Translate uncached fragments in small chunks and persist each completed chunk."""
     results: list[str | None] = [None] * len(items)
-    start_token = [f"ZXQSEG{i:05d}ZXQ" for i in range(len(items))]
-    end_token = [f"ZXQEND{i:05d}ZXQ" for i in range(len(items))]
+    start_tokens = [f"ZXQSEG{i:05d}ZXQ" for i in range(len(items))]
+    end_tokens = [f"ZXQEND{i:05d}ZXQ" for i in range(len(items))]
     protected: list[str] = []
     maps: list[dict[str, str]] = []
     for item in items:
         body, edge = _strip_edges(item)
         body_masked, mapping = _protect(body)
-        # Keep edge whitespace outside the translated region.
         maps.append({**mapping, "__LEADING__": edge[0], "__TRAILING__": edge[1]})
         protected.append(body_masked)
 
-    # Google Translate's public endpoint has a request-size limit. Work in chunks.
     pos = 0
     while pos < len(items):
         end = pos
@@ -377,52 +471,70 @@ def _translate_batch(items: list[str], translator) -> list[str]:
             if end > pos and size + estimate > 3200:
                 break
             if estimate > 4500:
-                # An individual fragment this large is translated separately below.
                 break
             size += estimate
             end += 1
+
         if end == pos:
-            end = pos + 1
+            # A single very long fragment cannot safely be included in a marker batch.
+            translated_item = _request_translate(protected[pos], translator)
+            _finish_translation(pos, translated_item, items, maps, results)
+            _save_translation_cache()
             pos += 1
-            results[end - 1] = _translate_one(protected[end - 1], translator)
             continue
 
         payload = "\n".join(
-            f"{start_token[j]}{protected[j]}{end_token[j]}" for j in range(pos, end)
+            f"{start_tokens[j]}{protected[j]}{end_tokens[j]}" for j in range(pos, end)
         )
-        translated = None
-        for attempt in range(3):
-            try:
-                translated = translator.translate(payload)
-                if translated:
-                    break
-            except Exception:
-                if attempt == 2:
-                    translated = None
-                else:
-                    time.sleep(1.5 * (attempt + 1))
-        if translated:
-            found_all = True
+        translated = _request_translate(payload, translator)
+        translated_segments: list[str] = []
+        found_all = True
+        for j in range(pos, end):
+            a = translated.find(start_tokens[j])
+            b = translated.find(end_tokens[j], a + len(start_tokens[j])) if a >= 0 else -1
+            if a < 0 or b < 0:
+                found_all = False
+                break
+            translated_segments.append(translated[a + len(start_tokens[j]):b].strip())
+
+        if found_all:
+            for offset, segment in enumerate(translated_segments):
+                _finish_translation(pos + offset, segment, items, maps, results)
+        else:
+            # If Google modifies the boundary markers, use separate requests for this
+            # chunk instead of accidentally putting translated text in the wrong span.
             for j in range(pos, end):
-                a = translated.find(start_token[j])
-                b = translated.find(end_token[j], a + len(start_token[j])) if a >= 0 else -1
-                if a < 0 or b < 0:
-                    found_all = False
-                    break
-                results[j] = translated[a + len(start_token[j]):b].strip()
-            if not found_all:
-                for j in range(pos, end):
-                    results[j] = None
+                translated_item = _request_translate(protected[j], translator)
+                _finish_translation(j, translated_item, items, maps, results)
+
+        # Save after every successful chunk: a later rate limit won't lose prior work.
+        _save_translation_cache()
         pos = end
 
-    for i, value in enumerate(results):
-        if value is None:
-            value = _translate_one(protected[i], translator)
-        mapping = maps[i]
-        body = _restore(value, {k: v for k, v in mapping.items() if not k.startswith("__")})
-        results[i] = mapping["__LEADING__"] + body + mapping["__TRAILING__"]
-    return [str(x) for x in results]
+    return [str(value) for value in results]
 
+
+def _translate_batch(items: list[str], translator) -> list[str]:
+    """Reuse cached translations and translate only fragments not seen in earlier runs."""
+    results: list[str | None] = [None] * len(items)
+    pending_items: list[str] = []
+    pending_indices: list[int] = []
+    for index, item in enumerate(items):
+        cached = _TRANSLATION_CACHE.get(_cache_key(item))
+        if cached is not None:
+            results[index] = cached
+        else:
+            pending_indices.append(index)
+            pending_items.append(item)
+
+    if pending_items:
+        translated = _translate_batch_uncached(pending_items, translator)
+        for index, value in zip(pending_indices, translated):
+            results[index] = value
+            _TRANSLATION_CACHE[_cache_key(items[index])] = value
+        _save_translation_cache()
+
+    return [str(value) for value in results]
 
 def _strip_edges(text: str) -> tuple[str, tuple[str, str]]:
     left = len(text) - len(text.lstrip())
@@ -433,19 +545,7 @@ def _strip_edges(text: str) -> tuple[str, tuple[str, str]]:
 def _translate_one(text: str, translator) -> str:
     if not text:
         return text
-    last_error = None
-    for attempt in range(3):
-        try:
-            result = translator.translate(text)
-            if result:
-                return result.strip()
-            last_error = RuntimeError("The translation service returned an empty result")
-        except Exception as exc:  # network rate-limits are retried, then surfaced clearly
-            last_error = exc
-            if attempt < 2:
-                time.sleep(1.5 * (attempt + 1))
-    raise RuntimeError(f"Google Translate failed: {last_error}") from last_error
-
+    return _request_translate(text, translator).strip()
 
 def iter_candidate_files() -> Iterable[Path]:
     for path in ROOT.rglob("*"):
@@ -475,6 +575,8 @@ def translate_repository(write: bool) -> tuple[int, int]:
             "Missing dependency. Install it with: python -m pip install deep-translator==1.11.4"
         ) from exc
 
+    _load_translation_cache()
+    print(f"Loaded {_TRANSLATION_CACHE.__len__()} cached translation(s).")
     translator = GoogleTranslator(source="zh-CN", target="en")
     edits = 0
     translated_regions = 0

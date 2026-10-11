@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CACHE_PATH = ROOT / "tools" / ".translation-cache.json"
 _TRANSLATION_CACHE: dict[str, str] = {}
 HAN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+TRANSLATION_CACHE_VERSION = "v2-kotlin-interpolation-safe"
 SUPPORTED_SUFFIXES = {
     ".kt", ".java", ".kts", ".gradle", ".cpp", ".cc", ".c", ".h", ".hpp",
     ".xml", ".md", ".sh", ".py", ".properties", ".txt", ".yml", ".yaml",
@@ -38,9 +39,9 @@ EXCLUDED_FILES = {
 # Protect runtime placeholders, format strings, escapes and URLs from the translator.
 PROTECTED_RE = re.compile(
     r"\$\{[^{}]*\}"                 # Kotlin/Gradle interpolation: ${value}
-    r"|\$[A-Za-z_][A-Za-z0-9_]*"     # Kotlin/Gradle interpolation: $value
+    r"|\$[^\W\d]\w*"               # $identifier, including Unicode letters in Kotlin names
     r"|%[-+#0-9 .]*[a-zA-Z]"          # printf-style formats: %02X, %s, %.2f
-    r"|\\(?:[\\\"'nrtbf]|u[0-9a-fA-F]{4})"  # escaped source characters
+    r"|\\(?:[\\\"'$nrtbf]|u[0-9a-fA-F]{4})"  # escaped source characters, including Kotlin \$ 
     r"|https?://[^\s)\]>]+"         # URLs, including Markdown links
 )
 
@@ -66,11 +67,20 @@ def _xml_spans(content: str) -> list[Span]:
             if _has_han(content[inner_start:inner_end]):
                 spans.append(Span(inner_start, inner_end, "text"))
         elif value.startswith("<"):
-            # Translate only attribute values that contain Chinese; keep quote marks/tags.
-            for q in re.finditer(r'''(["'])(.*?)\1''', value, re.S):
-                a, b = base + q.start(2), base + q.end(2)
+            # Never translate XML identifiers such as name/id/class/type: Android resource
+            # names become generated R.* symbols and must remain byte-for-byte stable.
+            human_attributes = {
+                "label", "contentdescription", "hint", "text", "title", "summary",
+                "alt", "placeholder", "tooltip", "prompt", "description",
+                "accessibilitylabel", "aria-label",
+            }
+            for q in re.finditer(r'''([:\w.-]+)\s*=\s*(["'])(.*?)\2''', value, re.S):
+                attr_name = q.group(1).lower().split(":")[-1]
+                if attr_name not in human_attributes:
+                    continue
+                a, b = base + q.start(3), base + q.end(3)
                 if _has_han(content[a:b]):
-                    spans.append(Span(a, b, "double" if q.group(1) == '"' else "single"))
+                    spans.append(Span(a, b, "double" if q.group(2) == '"' else "single"))
         else:
             # XML text node, e.g. <string name="open_file">打开文件</string>
             a, b = token.start(), token.end()
@@ -258,11 +268,9 @@ def _code_spans(content: str, suffix: str) -> list[Span]:
                 continue
 
         if ch == "`" and kotlin:
-            # Kotlin permits backtick-quoted test/function identifiers; translate these
-            # too so CJK test names do not remain in the source tree.
+            # Backtick-quoted Kotlin names are identifiers, not UI text. Translating them
+            # can change the symbol in only one declaration/reference and break compilation.
             close = content.find("`", i + 1)
-            end = n if close < 0 else close
-            add_span(i + 1, end, "backtick")
             i = n if close < 0 else close + 1
             continue
         if ch == '"':
@@ -336,8 +344,9 @@ def _escape_literal(text: str, quote: str) -> str:
     return "".join(out)
 
 
-def _cache_key(text: str) -> str:
-    return hashlib.sha256(("zh-CN\0en\0" + text).encode("utf-8")).hexdigest()
+def _cache_key(text: str, *, kotlin_string: bool = False) -> str:
+    context = "kotlin-string" if kotlin_string else "plain-text"
+    return hashlib.sha256((TRANSLATION_CACHE_VERSION + "\0" + context + "\0zh-CN\0en\0" + text).encode("utf-8")).hexdigest()
 
 
 def _load_translation_cache() -> None:
@@ -437,25 +446,31 @@ def _translate_plain_run(text: str, translator) -> str:
     return leading + translated + trailing
 
 
-def _translate_preserving_protected(text: str, translator) -> str:
-    """Translate only unprotected text runs; never send code tokens to the model.
+def _translate_preserving_protected(text: str, translator, *, kotlin_string: bool = False) -> str:
+    """Translate prose while protecting identifiers, placeholders, escapes and URLs.
 
-    Argos can alter artificial markers such as ZXQPH00000ZXQ. Splitting around the
-    original placeholders is safer: the protected parts never enter the translator,
-    so interpolation expressions, format specifiers, escapes and URLs are restored
-    byte-for-byte without relying on the model to preserve a marker.
+    In Kotlin strings, bare $identifier interpolation is rewritten as ${identifier}.
+    This is semantically equivalent Kotlin, and prevents a translation model from
+    dropping punctuation after the variable and accidentally merging translated text
+    into its name (e.g. $MAX_FOLDER_FILES + "Interrupted" -> $MAX_FOLDER_FILESInterrupted).
     """
     pieces: list[str] = []
     cursor = 0
+    bare_kotlin_name = re.compile(r"^\$([^\W\d]\w*)$", re.UNICODE)
     for match in PROTECTED_RE.finditer(text):
         pieces.append(_translate_plain_run(text[cursor:match.start()], translator))
-        pieces.append(match.group(0))
+        token = match.group(0)
+        if kotlin_string:
+            name_match = bare_kotlin_name.match(token)
+            if name_match:
+                token = "${" + name_match.group(1) + "}"
+        pieces.append(token)
         cursor = match.end()
     pieces.append(_translate_plain_run(text[cursor:], translator))
     return "".join(pieces)
 
 
-def _translate_batch_uncached(items: list[str], translator) -> list[str]:
+def _translate_batch_uncached(items: list[str], translator, kotlin_strings: list[bool]) -> list[str]:
     """Translate uncached fragments and persist progress in small batches.
 
     This intentionally translates each plain-text fragment independently instead
@@ -465,10 +480,12 @@ def _translate_batch_uncached(items: list[str], translator) -> list[str]:
     without rewriting the cache file for every single fragment.
     """
     results: list[str] = []
-    for index, item in enumerate(items):
+    if len(items) != len(kotlin_strings):
+        raise ValueError("Translation context count does not match fragment count")
+    for index, (item, kotlin_string) in enumerate(zip(items, kotlin_strings)):
         try:
             body, (leading, trailing) = _strip_edges(item)
-            translated_body = _translate_preserving_protected(body, translator)
+            translated_body = _translate_preserving_protected(body, translator, kotlin_string=kotlin_string)
             final_value = leading + translated_body + trailing
             results.append(final_value)
             _TRANSLATION_CACHE[_cache_key(item)] = final_value
@@ -483,24 +500,28 @@ def _translate_batch_uncached(items: list[str], translator) -> list[str]:
     return results
 
 
-def _translate_batch(items: list[str], translator) -> list[str]:
-    """Reuse cached translations and translate only fragments not seen in earlier runs."""
+def _translate_batch(items: list[str], translator, kotlin_strings: list[bool]) -> list[str]:
+    """Reuse context-specific cached translations and translate only unseen fragments."""
+    if len(items) != len(kotlin_strings):
+        raise ValueError("Translation context count does not match fragment count")
     results: list[str | None] = [None] * len(items)
     pending_items: list[str] = []
+    pending_kotlin_strings: list[bool] = []
     pending_indices: list[int] = []
-    for index, item in enumerate(items):
-        cached = _TRANSLATION_CACHE.get(_cache_key(item))
+    for index, (item, kotlin_string) in enumerate(zip(items, kotlin_strings)):
+        cached = _TRANSLATION_CACHE.get(_cache_key(item, kotlin_string=kotlin_string))
         if cached is not None:
             results[index] = cached
         else:
             pending_indices.append(index)
             pending_items.append(item)
+            pending_kotlin_strings.append(kotlin_string)
 
     if pending_items:
-        translated = _translate_batch_uncached(pending_items, translator)
+        translated = _translate_batch_uncached(pending_items, translator, pending_kotlin_strings)
         for index, value in zip(pending_indices, translated):
             results[index] = value
-            _TRANSLATION_CACHE[_cache_key(items[index])] = value
+            _TRANSLATION_CACHE[_cache_key(items[index], kotlin_string=kotlin_strings[index])] = value
         _save_translation_cache()
 
     return [str(value) for value in results]
@@ -552,7 +573,9 @@ def translate_repository(write: bool) -> tuple[int, int]:
             continue
 
         fragments = [content[span.start:span.end] for span in spans]
-        replacements = _translate_batch(fragments, translator)
+        is_kotlin = path.suffix.lower() in {".kt", ".kts"}
+        kotlin_strings = [is_kotlin and span.kind in {"double", "raw"} for span in spans]
+        replacements = _translate_batch(fragments, translator, kotlin_strings)
         new_content = content
         # Apply replacements backwards so offsets remain valid.
         for span, replacement in reversed(list(zip(spans, replacements))):
@@ -563,11 +586,6 @@ def translate_repository(write: bool) -> tuple[int, int]:
             elif span.kind in {"double", "single"}:
                 quote = '"' if span.kind == "double" else "'"
                 replacement = _escape_literal(replacement, quote)
-            elif span.kind == "backtick":
-                # Kotlin backtick identifiers cannot contain several punctuation
-                # characters. Convert those to hyphens while keeping the name legal.
-                replacement = re.sub(r"[.;/\\\[\]<>:`]", "-", replacement)
-                replacement = re.sub(r"-+", "-", replacement).strip("- ") or "translated_name"
             new_content = new_content[:span.start] + replacement + new_content[span.end:]
 
         if new_content != content:
@@ -586,9 +604,16 @@ def check_repository() -> int:
         content = read_utf8(path)
         if content is None:
             continue
-        for line_number, line in enumerate(content.splitlines(), 1):
-            if _has_han(line):
-                excerpt = line.strip().replace("\t", " ")
+        suffix = path.suffix.lower() or ".txt"
+        for span in extract_spans(content, suffix):
+            fragment = content[span.start:span.end]
+            if _has_han(fragment):
+                line_number = content.count("\n", 0, span.start) + 1
+                line_start = content.rfind("\n", 0, span.start) + 1
+                line_end = content.find("\n", span.start)
+                if line_end < 0:
+                    line_end = len(content)
+                excerpt = content[line_start:line_end].strip().replace("\t", " ")
                 leftovers.append((path.relative_to(ROOT), line_number, excerpt[:180]))
     if leftovers:
         print(f"Found {len(leftovers)} line(s) that still contain Chinese:", file=sys.stderr)

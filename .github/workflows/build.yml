@@ -82,13 +82,25 @@ jobs:
       - name: Install Android SDK, NDK and CMake
         shell: bash
         run: |
-          yes | sdkmanager --licenses >/dev/null
-          sdkmanager \
-            "platform-tools" \
-            "platforms;android-34" \
-            "build-tools;34.0.0" \
-            "ndk;26.3.11579264" \
-            "cmake;3.22.1"
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [[ -z "$SDK_ROOT" ]]; then
+            echo "::error::ANDROID_SDK_ROOT and ANDROID_HOME are both unset."
+            exit 1
+          fi
+          if ! command -v android >/dev/null 2>&1; then
+            echo "::error::Android CLI ('android') was not found on PATH."
+            exit 1
+          fi
+          # setup-android already accepts Android SDK licenses. Use the current
+          # Android CLI instead of deprecated sdkmanager; avoid `yes | ...`,
+          # which fails under GitHub Actions' pipefail when the consumer exits.
+          android --sdk="$SDK_ROOT" sdk install \
+            platform-tools \
+            platforms/android-34 \
+            build-tools/34.0.0 \
+            ndk/26.3.11579264 \
+            cmake/3.22.1
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6

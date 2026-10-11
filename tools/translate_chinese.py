@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Translate Chinese text in source comments, string literals, XML, and Markdown.
+"""Translate Chinese text in source comments, strings, XML, and Markdown.
 
-This tool edits only textual regions (comments, quoted strings, XML text/attributes,
-and Markdown lines). It does not rename identifiers or rewrite binary assets.
-Translation is performed using Google Translate through deep-translator.
+Only selected human-readable text regions are edited; identifiers, code syntax,
+URLs, format placeholders, binary assets, and 3D mesh data are preserved. Translation
+uses the local Argos Translate zh -> en model, so each string is translated offline
+without making one web request per string.
 """
 from __future__ import annotations
 
@@ -13,16 +14,12 @@ import json
 import os
 import re
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
 CACHE_PATH = ROOT / "tools" / ".translation-cache.json"
-REQUEST_INTERVAL_SECONDS = max(0.5, float(os.getenv("TRANSLATE_MIN_INTERVAL_SECONDS", "0.8")))
-MAX_TRANSLATE_ATTEMPTS = max(3, int(os.getenv("TRANSLATE_MAX_ATTEMPTS", "6")))
-_LAST_REQUEST_AT = 0.0
 _TRANSLATION_CACHE: dict[str, str] = {}
 HAN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 SUPPORTED_SUFFIXES = {
@@ -395,50 +392,60 @@ def _save_translation_cache() -> None:
 
 
 def _request_translate(text: str, translator) -> str:
-    """Call Google Translate slowly, and use exponential backoff for rate limits."""
-    global _LAST_REQUEST_AT
+    """Translate locally with Argos; no rate-limited external API requests."""
     if not text:
         return text
+    try:
+        result = translator.translate(text)
+    except Exception as exc:
+        raise RuntimeError(f"Local Argos translation failed: {exc}") from exc
+    if result is None or not str(result).strip():
+        raise RuntimeError("Local Argos translation returned an empty result")
+    return str(result)
 
-    last_error: Exception | None = None
-    for attempt in range(MAX_TRANSLATE_ATTEMPTS):
-        elapsed = time.monotonic() - _LAST_REQUEST_AT
-        if elapsed < REQUEST_INTERVAL_SECONDS:
-            time.sleep(REQUEST_INTERVAL_SECONDS - elapsed)
 
-        try:
-            result = translator.translate(text)
-            _LAST_REQUEST_AT = time.monotonic()
-            if result:
-                return result
-            last_error = RuntimeError("The translation service returned an empty result")
-        except Exception as exc:
-            _LAST_REQUEST_AT = time.monotonic()
-            last_error = exc
+def _load_argos_translator():
+    """Return the installed Chinese-to-English translation, installing its model if needed."""
+    try:
+        import argostranslate.package as argos_package
+        import argostranslate.translate as argos_translate
+    except ImportError as exc:
+        raise RuntimeError(
+            "Missing dependency. Install with: python -m pip install -r tools/requirements-translate.txt"
+        ) from exc
 
-        if attempt + 1 >= MAX_TRANSLATE_ATTEMPTS:
-            break
+    def find_translation():
+        languages = argos_translate.get_installed_languages()
+        source = next((language for language in languages if language.code == "zh"), None)
+        target = next((language for language in languages if language.code == "en"), None)
+        if source is None or target is None:
+            return None
+        return source.get_translation(target)
 
-        message = str(last_error).lower()
-        rate_limited = any(term in message for term in (
-            "too many requests", "429", "rate limit", "rate-limit", "too frequent",
-            "server error", "503", "temporarily unavailable", "forbidden",
-        ))
-        if rate_limited:
-            # Google may keep throttling a runner IP for a while. Back off much more
-            # aggressively than the previous fixed 1.5/3-second retry loop.
-            wait_seconds = min(60.0, 10.0 * (2 ** attempt))
-        else:
-            wait_seconds = min(20.0, 2.0 * (attempt + 1))
-        print(
-            f"Translation request failed ({attempt + 1}/{MAX_TRANSLATE_ATTEMPTS}): "
-            f"{last_error}. Retrying in {wait_seconds:g}s...",
-            file=sys.stderr,
+    translation = find_translation()
+    if translation is not None:
+        print("Using cached Argos Chinese → English model.")
+        return translation
+
+    print("Installing the Argos Chinese → English language model (first run only)...")
+    try:
+        argos_package.update_package_index()
+        package = next(
+            (item for item in argos_package.get_available_packages()
+             if item.from_code == "zh" and item.to_code == "en"),
+            None,
         )
-        time.sleep(wait_seconds)
+        if package is None:
+            raise RuntimeError("Argos package index has no Chinese (zh) → English (en) model")
+        model_path = package.download()
+        argos_package.install_from_path(model_path)
+    except Exception as exc:
+        raise RuntimeError(f"Could not download/install the Argos zh→en model: {exc}") from exc
 
-    raise RuntimeError(f"Google Translate failed after retries: {last_error}") from last_error
-
+    translation = find_translation()
+    if translation is None:
+        raise RuntimeError("Argos zh→en model installed, but the translation was not registered")
+    return translation
 
 def _finish_translation(index: int, value: str, items: list[str], maps: list[dict[str, str]], results: list[str | None]) -> None:
     mapping = maps[index]
@@ -568,16 +575,9 @@ def read_utf8(path: Path) -> str | None:
 
 
 def translate_repository(write: bool) -> tuple[int, int]:
-    try:
-        from deep_translator import GoogleTranslator
-    except ImportError as exc:
-        raise RuntimeError(
-            "Missing dependency. Install it with: python -m pip install deep-translator==1.11.4"
-        ) from exc
-
     _load_translation_cache()
-    print(f"Loaded {_TRANSLATION_CACHE.__len__()} cached translation(s).")
-    translator = GoogleTranslator(source="zh-CN", target="en")
+    print(f"Loaded {len(_TRANSLATION_CACHE)} cached translation(s).")
+    translator = _load_argos_translator()
     edits = 0
     translated_regions = 0
     for path in sorted(iter_candidate_files()):

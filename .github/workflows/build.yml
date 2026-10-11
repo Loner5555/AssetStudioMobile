@@ -23,7 +23,7 @@ jobs:
   build:
     name: Translate source and build Android APKs
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
 
     steps:
       - name: Checkout source
@@ -34,9 +34,16 @@ jobs:
       - name: Set up Python for translation
         uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          # Argos Translate's native dependencies have reliable wheels on Python 3.11.
+          python-version: "3.11"
           cache: pip
           cache-dependency-path: tools/requirements-translate.txt
+
+      - name: Cache Argos Chinese-English model
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/argos-translate
+          key: argos-translate-zh-en-v1-${{ runner.os }}
 
       - name: Restore translation cache
         uses: actions/cache/restore@v4
@@ -50,10 +57,7 @@ jobs:
       - name: Install translation dependency
         run: python -m pip install --disable-pip-version-check -r tools/requirements-translate.txt
 
-      - name: Translate Chinese text to English
-        env:
-          TRANSLATE_MIN_INTERVAL_SECONDS: "0.8"
-          TRANSLATE_MAX_ATTEMPTS: "6"
+      - name: Translate Chinese text to English (offline model)
         run: python tools/translate_chinese.py --write
 
       - name: Save translation cache (including partial progress)

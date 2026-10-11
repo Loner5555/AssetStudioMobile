@@ -179,4 +179,4 @@ When a workflow run completes, open **Actions → the completed run → Artifact
 - `AssetStudioMobile-APKs` — debug and release APKs.
 - `AssetStudioMobile-translated-source` — a ZIP archive of the translated source tree.
 
-To run it manually, open **Actions → Translate Chinese and Build APK → Run workflow**. Enable `commit_translations` only if you want the workflow to commit translated files back to the selected branch. The translator uses Google Translate through `deep-translator`, so the runner needs internet access and the text being translated is sent to that external service.
+To run it manually, open **Actions → Translate Chinese and Build APK → Run workflow**. Enable `commit_translations` only if you want the workflow to commit translated files back to the selected branch. The translator uses the open-source Argos Translate Chinese-to-English model locally. GitHub Actions downloads the model on the first run and caches it for later runs; translating source strings does not make per-string requests to Google Translate. Translation quality may be less fluent than a cloud translation service, so review user-facing text before release.

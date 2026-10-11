@@ -25,5 +25,5 @@ Thumbs.db
 # Logs
 *.log
 
-# Temporary Google Translate cache (kept between workflow runs only)
+# Translation cache (kept between workflow runs only)
 tools/.translation-cache.json
